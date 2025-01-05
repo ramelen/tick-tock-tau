@@ -1,0 +1,15 @@
+[package]
+name = "tick-tock-tau"
+version = "1.0.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+argh = "^0.1"
+malachite = "^0.4"
+malachite-float = "^0.4"
+mimalloc = { version = "^0.1", default-features = false }

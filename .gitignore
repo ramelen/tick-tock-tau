@@ -1,0 +1,9 @@
+debug/
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+documents/
+logs/
+results/
+.DS_Store
