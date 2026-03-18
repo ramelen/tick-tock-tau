@@ -1,4 +1,4 @@
-use crate::model;
+use crate::model::{self, MathError};
 use argh::FromArgs;
 use std::{
     collections::BinaryHeap,
@@ -73,10 +73,25 @@ pub fn run(config: Config) {
     for thread_id in 0..config.num_threads {
         let channel = sender.clone();
         thread::spawn(move || {
+            let mut interval_precision = 12;
             let byte_indices = first_byte_index..(first_byte_index + config.num_bytes);
             for byte_index in byte_indices.skip(thread_id).step_by(config.num_threads) {
                 let byte_time = Instant::now();
-                let byte = model::calculate_byte(byte_index);
+                let precision = (2 * (byte_index + 1).ilog2() + 8).into();
+                let byte = model::calculate_byte(byte_index, precision).unwrap();
+                let byte_interval = loop {
+                    match model::calculate_byte_interval(byte_index, interval_precision) {
+                        Ok(byte) => break byte,
+                        Err(MathError::InsufficientPrecision(_, _)) => interval_precision += 1,
+                        Err(e) => panic!("{e}"),
+                    };
+                };
+
+                if byte != byte_interval {
+                    panic!(
+                        "Ordinary byte ({byte:02X}) and interval byte ({byte_interval:02X}) do not agree."
+                    );
+                }
 
                 channel
                     .send(model::ByteInfo::new(

@@ -1,18 +1,24 @@
+mod intervals;
+
 use malachite::{
-    num::{
-        arithmetic::traits::{ModPow, ModPowerOf2, PowerOf2, Reciprocal},
-        basic::traits::{One, Two, Zero},
-        conversion::traits::{RoundingFrom, WrappingFrom},
-    },
-    rounding_modes::RoundingMode::{Floor, Nearest},
     Integer, Natural,
+    base::{
+        num::{
+            arithmetic::traits::{ModPow, ModPowerOf2, PowerOf2, Reciprocal},
+            basic::traits::{NegativeOne, One, Two, Zero},
+            conversion::traits::{RoundingFrom, WrappingFrom},
+        },
+        rounding_modes::RoundingMode::Floor,
+    },
 };
 use malachite_float::Float;
 use std::{
-    cmp::Ordering::{Greater, Less},
     fmt::{self, Debug, Display},
-    ops::Shr,
+    num::TryFromIntError,
 };
+use thiserror::Error;
+
+use crate::model::intervals::Interval;
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct ByteInfo {
@@ -59,26 +65,57 @@ impl Debug for ByteInfo {
     }
 }
 
-pub fn calculate_byte(pos: usize) -> u8 {
-    if pos == 0 {
-        return 6;
-    }
-
-    let pi = false;
-    let prec = 2 * (pos + 1).ilog2() + 8;
-    let lower_nibble_index = (2 * pos).try_into().unwrap();
-    let upper_nibble_index = lower_nibble_index - 1;
-    16 * calc_nibble(upper_nibble_index, prec, pi) + calc_nibble(lower_nibble_index, prec, pi)
+#[derive(Error, Debug)]
+pub enum MathError {
+    #[error("{0} bits of precision was not enough to calculate nibble {1}")]
+    InsufficientPrecision(u64, isize),
+    #[error("failed to convert between two number types")]
+    FailedConversion(#[from] TryFromIntError),
 }
 
-fn calc_nibble(p: isize, fp: u32, pi: bool) -> u8 {
-    let mul = if pi { 16 } else { 32 };
+/// Calculates the nth byte of the binary expansion of tau, where byte zero is the integer part (six).
+pub fn calculate_byte(pos: usize, fp: u64) -> Result<u8, MathError> {
+    if pos == 0 {
+        return Ok(6);
+    }
+
+    let lower_nibble_index = (2 * pos).try_into()?;
+
+    let upper_nibble_index = lower_nibble_index - 1;
+    Ok(16 * calc_nibble(upper_nibble_index, fp)? + calc_nibble(lower_nibble_index, fp)?)
+}
+
+/// Calculates the nth byte of the binary expansion of tau, where byte zero is the integer part (six). Uses interval arithmetic to guarantee that the result is correct.
+pub fn calculate_byte_interval(pos: usize, fp: u64) -> Result<u8, MathError> {
+    if pos == 0 {
+        return Ok(6);
+    }
+
+    let lower_nibble_index = (2 * pos).try_into()?;
+
+    let upper_nibble_index = lower_nibble_index - 1;
+
+    Ok(16 * calc_nibble_interval(upper_nibble_index, fp)?
+        + calc_nibble_interval(lower_nibble_index, fp)?)
+}
+
+fn calc_nibble(p: isize, fp: u64) -> Result<u8, MathError> {
+    const MUL: Float = Float::const_from_unsigned(16);
     let mut r = Float::ZERO;
 
-    for i in 0usize.. {
-        let exp: isize = 4 * p - 10 - 10 * isize::try_from(i).unwrap();
-        let sign: Float = if i & 1 == 0 { mul } else { -mul }.into();
+    let end = usize::try_from(p)? * 4 / 10;
+    for i in 0usize..=end {
+        let index: isize = i.try_into()?;
+        let exp: isize = 4 * p - 10 * index - 9;
+
+        let sign = if i % 2 == 0 {
+            Float::ONE
+        } else {
+            Float::NEGATIVE_ONE
+        };
+
         let change: Float = sign
+            * MUL
             * (-sigma(exp + 5, 4 * i + 1, fp) - sigma(exp, 4 * i + 3, fp)
                 + sigma(exp + 8, 10 * i + 1, fp)
                 - sigma(exp + 6, 10 * i + 3, fp)
@@ -88,23 +125,86 @@ fn calc_nibble(p: isize, fp: u32, pi: bool) -> u8 {
 
         r += &change;
 
-        if exp >= 0 {
+        if exp < 0 {
+            break;
+        }
+    }
+    Ok(u8::wrapping_from(
+        &Integer::rounding_from(&r, Floor).0.mod_power_of_2(4),
+    ))
+}
+
+fn calc_nibble_interval(p: isize, fp: u64) -> Result<u8, MathError> {
+    const MUL: Float = Float::const_from_unsigned(16);
+    let mut r = Interval::ZERO;
+
+    for i in 0usize.. {
+        let index = isize::try_from(i)?;
+        let exp: isize = 4 * p - 9 - 10 * index;
+
+        let sign = if i % 2 == 0 {
+            Float::ONE
+        } else {
+            Float::NEGATIVE_ONE
+        };
+
+        let change: Interval = sign
+            * MUL
+            * (-sigma_interval(exp + 5, 4 * i + 1, fp) - sigma_interval(exp, 4 * i + 3, fp)
+                + sigma_interval(exp + 8, 10 * i + 1, fp)
+                - sigma_interval(exp + 6, 10 * i + 3, fp)
+                - sigma_interval(exp + 2, 10 * i + 5, fp)
+                - sigma_interval(exp + 2, 10 * i + 7, fp)
+                + sigma_interval(exp, 10 * i + 9, fp));
+
+        r += change.clone();
+
+        if exp + 8 >= 0 {
             continue;
         }
 
-        let (round, ord) = Integer::rounding_from(&r, Nearest);
-        let dist = Float::from(round) - &r;
+        let floor = r
+            .try_floor()
+            .ok_or(MathError::InsufficientPrecision(fp, p))?;
+        let ceiling = r
+            .try_ceil()
+            .ok_or(MathError::InsufficientPrecision(fp, p))?;
 
-        if !(ord == Less && (&change).shr(20) < dist || ord == Greater && (&change).shr(10) < -dist)
-        {
-            break;
+        let (next_odd, next_even) = match i % 2 {
+            0 => (index + 1, index + 2),
+            1 => (index + 2, index + 1),
+            2.. => unreachable!(),
         };
+
+        let dist_to_floor = &r - Interval::from(Float::from_integer_prec_ref(&floor, fp));
+        let max_dist_to_floor = Interval::from(Float::power_of_2_prec(
+            (4 * p - 3 - 10 * next_odd).try_into()?, // multiply by 64 > 44.22...
+            fp,
+        ));
+
+        if max_dist_to_floor.upper >= dist_to_floor.lower {
+            println!("nibble {p} needs another term from below");
+            continue;
+        }
+
+        let dist_to_ceil = Interval::from(Float::from_integer_prec(ceiling, fp)) - &r;
+        let max_dist_to_ceil = Interval::from(Float::power_of_2_prec(
+            (4 * p - 3 - 10 * next_even).try_into()?, // multiply by 64 > 44.22...
+            fp,
+        ));
+
+        if max_dist_to_ceil.upper >= dist_to_ceil.lower {
+            println!("nibble {p} needs another term from above");
+            continue;
+        }
+
+        return Ok(u8::wrapping_from(&floor.mod_power_of_2(4)));
     }
-    u8::wrapping_from(&Integer::rounding_from(&r, Floor).0.mod_power_of_2(4))
+    unreachable!()
 }
 
-fn sigma(exp: isize, denom: usize, fp: u32) -> Float {
-    let fdenom: Float = Float::from_unsigned_prec(denom, fp.into()).0;
+fn sigma(exp: isize, denom: usize, fp: u64) -> Float {
+    let fdenom: Float = Float::from_unsigned_prec(denom, fp).0;
     let pow: u64 = exp.unsigned_abs().try_into().unwrap();
 
     if exp <= 0 {
@@ -112,7 +212,25 @@ fn sigma(exp: isize, denom: usize, fp: u32) -> Float {
     } else if denom == 1 {
         Float::ONE
     } else {
-        Float::from(Natural::TWO.mod_pow(Natural::from(pow), Natural::from(denom))) / fdenom
+        Float::from_natural_prec(
+            Natural::TWO.mod_pow(Natural::from(pow), Natural::from(denom)),
+            fp,
+        )
+        .0 / fdenom
+    }
+}
+
+fn sigma_interval(exp: isize, denom: usize, fp: u64) -> Interval {
+    let denom_int: Interval = Float::from_unsigned_prec(denom, fp).into();
+    let pow: u64 = exp.unsigned_abs().try_into().unwrap();
+
+    if exp <= 0 {
+        (Float::power_of_2(pow) * denom_int).recip()
+    } else if denom == 1 {
+        Interval::ONE
+    } else {
+        let numer = Natural::TWO.mod_pow(Natural::from(pow), Natural::from(denom));
+        Interval::from(Float::from_natural_prec(numer, fp)) / denom_int
     }
 }
 
@@ -122,15 +240,34 @@ mod tests {
 
     #[test]
     fn first_256() {
-        assert_eq!(
-            (0..256).map(calculate_byte).collect::<Vec<_>>(),
-            TAU[0..256]
-        );
+        for (i, expected) in TAU.into_iter().enumerate().take(256) {
+            let precision = (2 * (i + 1).ilog2() + 8).into();
+            assert_eq!(calculate_byte(i, precision).unwrap(), expected);
+        }
     }
 
     #[test]
     fn first_4096() {
-        assert_eq!((0..4096).map(calculate_byte).collect::<Vec<_>>(), TAU);
+        for (i, expected) in TAU.into_iter().enumerate() {
+            let precision = (2 * (i + 1).ilog2() + 8).into();
+            assert_eq!(calculate_byte(i, precision).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn first_256_interval() {
+        for (i, expected) in TAU.into_iter().enumerate().take(256) {
+            let precision = (2 * (i + 1).ilog2() + 8).into();
+            assert_eq!(calculate_byte(i, precision).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn first_4096_interval() {
+        for (i, expected) in TAU.into_iter().enumerate() {
+            let precision = (2 * (i + 1).ilog2() + 8).into();
+            assert_eq!(calculate_byte(i, precision).unwrap(), expected);
+        }
     }
 
     const TAU: [u8; 4096] = [
