@@ -16,14 +16,14 @@ use std::{
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct ByteInfo {
-    pub pos: isize,
+    pub pos: usize,
     pub byte: u8,
     pub byte_time: usize,
     pub total_time: usize,
 }
 
 impl ByteInfo {
-    pub fn new(pos: isize, byte: u8, byte_time: usize, total_time: usize) -> Self {
+    pub fn new(pos: usize, byte: u8, byte_time: usize, total_time: usize) -> Self {
         Self {
             pos,
             byte,
@@ -59,9 +59,16 @@ impl Debug for ByteInfo {
     }
 }
 
-pub fn calc_byte(pos: isize, pi: bool) -> u8 {
+pub fn calculate_byte(pos: usize) -> u8 {
+    if pos == 0 {
+        return 6;
+    }
+
+    let pi = false;
     let prec = 2 * (pos + 1).ilog2() + 8;
-    16 * calc_nibble(2 * pos - 1, prec, pi) + calc_nibble(2 * pos, prec, pi)
+    let lower_nibble_index = (2 * pos).try_into().unwrap();
+    let upper_nibble_index = lower_nibble_index - 1;
+    16 * calc_nibble(upper_nibble_index, prec, pi) + calc_nibble(lower_nibble_index, prec, pi)
 }
 
 fn calc_nibble(p: isize, fp: u32, pi: bool) -> u8 {
@@ -86,7 +93,7 @@ fn calc_nibble(p: isize, fp: u32, pi: bool) -> u8 {
         }
 
         let (round, ord) = Integer::rounding_from(&r, Nearest);
-        let dist = float(round) - &r;
+        let dist = Float::from(round) - &r;
 
         if !(ord == Less && (&change).shr(20) < dist || ord == Greater && (&change).shr(10) < -dist)
         {
@@ -105,22 +112,8 @@ fn sigma(exp: isize, denom: usize, fp: u32) -> Float {
     } else if denom == 1 {
         Float::ONE
     } else {
-        float(Natural::TWO.mod_pow(natural(pow), natural(denom))) / fdenom
+        Float::from(Natural::TWO.mod_pow(Natural::from(pow), Natural::from(denom))) / fdenom
     }
-}
-
-fn natural<T>(x: T) -> Natural
-where
-    Natural: From<T>,
-{
-    Natural::from(x)
-}
-
-fn float<T>(x: T) -> Float
-where
-    Float: From<T>,
-{
-    Float::from(x)
 }
 
 #[cfg(test)]
@@ -128,11 +121,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_4096() {
+    fn first_256() {
         assert_eq!(
-            (0..4096).map(|i| calc_byte(i, false)).collect::<Vec<_>>(),
-            TAU
+            (0..256).map(calculate_byte).collect::<Vec<_>>(),
+            TAU[0..256]
         );
+    }
+
+    #[test]
+    fn first_4096() {
+        assert_eq!((0..4096).map(calculate_byte).collect::<Vec<_>>(), TAU);
     }
 
     const TAU: [u8; 4096] = [
