@@ -1,9 +1,14 @@
-use crate::model::{self, MathError};
+use crate::model;
 use argh::FromArgs;
+use malachite::base::num::conversion::traits::OverflowingFrom;
+use malachite::base::num::logic::traits::SignificantBits;
+use malachite::{Natural, base::num::basic::traits::One};
+
 use std::{
     collections::BinaryHeap,
     fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
+    io::{self, Seek, SeekFrom, Write},
+    str::FromStr,
     sync::mpsc,
     thread,
     time::Instant,
@@ -21,113 +26,143 @@ pub struct Config {
     #[argh(option, long = "log", short = 'l')]
     pub log_path: Option<String>,
 
-    /// skip the specified number of bytes in the output, including the byte before the decimal place. if an output path is supplied, this will default to the size of the file. note that the output bytes will be written to their corresponding index, so skipping a billion bytes will result in a 1 GB file filled with mostly zeros.
-    #[argh(option, long = "skip", short = 's')]
+    /// skip the specified number of bytes in the output, including the byte before the decimal place. if an output path is supplied, this will default to the size of the file. note that the output bytes will be written to their corresponding index, so skipping a billion bytes will result in a 1 GB file filled with mostly zeros. if this is not desired, consider specifying a log path instead of an output path.
+    #[argh(option, long = "skip", short = 's', from_str_fn(parse_natural))]
     // the number of bytes to skip and the start index happen to be the same because the former is one-indexed while the latter is zero-indexed.
-    pub start_index: Option<usize>,
+    pub start_index: Option<Natural>,
 
     /// the number of bytes of tau to calculate
-    #[argh(option, long = "bytes", short = 'b', default = "usize::MAX")]
-    pub num_bytes: usize,
+    #[argh(option, long = "bytes", short = 'b', from_str_fn(parse_natural))]
+    pub num_bytes: Option<Natural>,
 
     /// calculate bytes in parallel using the specified number of threads (1 by default)
     #[argh(option, long = "threads", short = 't', default = "1")]
-    pub num_threads: usize,
+    pub num_threads: u64,
 
     /// do not print the most recent byte information while the program is running. note: this information will still be logged if a path is specified.
     #[argh(switch, long = "quiet", short = 'q')]
     pub is_quiet: bool,
+
+    /// skip calculation of error bounds to save some extra calculations, at the cost of an extraordinarily small chance that the algorithm produces an incorrect digit every once in a while.
+    #[argh(switch, long = "fast")]
+    pub fast: bool,
 }
 
-pub fn run(config: Config) {
-    let mut output = config.output_path.and_then(|path| {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .ok()
-    });
+pub fn run(config: Config) -> Result<(), io::Error> {
+    // open the output file if a path was given, returning early if the file couldn't be opened
+    let mut output = config
+        .output_path
+        .map(|path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+        })
+        .transpose()?;
 
+    // similarly, open the log file if a path was given
     let mut log = config
         .log_path
-        .and_then(|path| OpenOptions::new().append(true).create(true).open(path).ok());
+        .map(|path| OpenOptions::new().append(true).create(true).open(path))
+        .transpose()?;
 
-    let len = output
+    // try to get the length
+    let len: u64 = output
         .as_ref()
-        .and_then(|file| {
-            file.metadata()
-                .expect("should have gotten metadata")
-                .len()
-                .try_into()
-                .ok()
-        })
+        .map(|file| file.metadata().map(|metadata| metadata.len()))
+        .transpose()? // return if getting the metadata failed
         .unwrap_or(0);
 
-    let first_byte_index = config.start_index.unwrap_or(len);
+    // the index of the first byte to calculate, with 6 at index 0.
+    let first_byte_index = config.start_index.unwrap_or(Natural::from(len));
+    let last_byte_index = config.num_bytes.map(|n| &first_byte_index + n);
 
     let program_start_time = Instant::now();
     let (sender, reciever) = mpsc::channel();
 
     for thread_id in 0..config.num_threads {
         let channel = sender.clone();
+        let first_byte_index = first_byte_index.clone();
+        let last_byte_index = last_byte_index.clone();
         thread::spawn(move || {
+            // initial value, incremented each time there is not enough precision
             let mut interval_precision = 12;
-            let byte_indices = first_byte_index..(first_byte_index + config.num_bytes);
-            for byte_index in byte_indices.skip(thread_id).step_by(config.num_threads) {
-                let byte_time = Instant::now();
-                let precision = (2 * (byte_index + 1).ilog2() + 8).into();
-                let byte = model::calculate_byte(byte_index, precision).unwrap();
-                let byte_interval = loop {
-                    match model::calculate_byte_interval(byte_index, interval_precision) {
-                        Ok(byte) => break byte,
-                        Err(MathError::InsufficientPrecision(_, _)) => interval_precision += 1,
-                        Err(e) => panic!("{e}"),
-                    };
-                };
+            // first byte to be calculated
+            let first_thread_index = first_byte_index + Natural::from(thread_id);
+            let mut byte_index = first_thread_index;
 
-                if byte != byte_interval {
-                    panic!(
-                        "Ordinary byte ({byte:02X}) and interval byte ({byte_interval:02X}) do not agree."
-                    );
-                }
+            // loop until the last byte has been reached
+            while last_byte_index
+                .clone()
+                .into_iter()
+                .all(|last| byte_index <= last)
+            {
+                let byte_time = Instant::now();
+
+                let byte = if config.fast {
+                    let precision = 2 * byte_index.significant_bits() + 8;
+                    model::calculate_byte(&byte_index, precision)
+                } else {
+                    loop {
+                        match model::calculate_byte_interval(&byte_index, interval_precision) {
+                            Some(byte) => break byte,
+                            None => {
+                                // eprintln!(
+                                //     "\rbyte {} needs more precision than {interval_precision}        ",
+                                //     byte_index.clone()
+                                // );
+                                interval_precision += 1
+                            }
+                        };
+                    }
+                };
 
                 channel
                     .send(model::ByteInfo::new(
-                        byte_index,
+                        byte_index.clone(),
                         byte,
                         byte_time.elapsed().as_millis() as usize,
                         program_start_time.elapsed().as_millis() as usize,
                     ))
                     .unwrap();
+
+                byte_index += Natural::from(config.num_threads);
             }
         });
     }
     drop(sender);
 
     let mut queue = BinaryHeap::new();
-    let mut latest = model::ByteInfo::new(first_byte_index.wrapping_sub(1), 0, 0, 0);
-    let mut bytes = Vec::with_capacity(config.num_threads * 2);
+    let mut next_pos = first_byte_index.clone();
+    let mut bytes = Vec::with_capacity(2 * config.num_threads as usize);
 
     if let Some(file) = output.as_mut() {
-        file.seek(SeekFrom::Start(first_byte_index.try_into().unwrap()))
-            .expect("should have moved to correct position");
+        let (small_index, overflowed) = u64::overflowing_from(&first_byte_index);
+        if !overflowed {
+            file.seek(SeekFrom::Start(small_index))?;
+        } else {
+            eprintln!("Warning: start index is greater than 2^64 - 1, ignoring output file...");
+            output = None;
+        }
     }
 
     for item in reciever {
         queue.push(std::cmp::Reverse(item));
 
-        while queue
-            .peek()
-            .is_some_and(|data| data.0.pos == latest.pos.wrapping_add(1))
-        {
-            latest = queue.pop().unwrap().0;
+        while queue.peek().is_some_and(|data| data.0.pos == next_pos) {
+            let data = queue.pop().unwrap().0;
+            next_pos += Natural::ONE;
 
-            bytes.push(latest.byte);
+            bytes.push(data.byte);
+
+            if !config.is_quiet {
+                print!("\r{data:?}",);
+            }
 
             if let Some(file) = log.as_mut() {
-                writeln!(file, "{latest}",).expect("should have written to file");
+                writeln!(file, "{data}",)?;
             }
         }
 
@@ -136,7 +171,6 @@ pub fn run(config: Config) {
         }
 
         if !config.is_quiet {
-            print!("\r{latest:?}",);
             std::io::stdout().flush().unwrap();
         }
 
@@ -145,5 +179,17 @@ pub fn run(config: Config) {
         };
 
         bytes.clear();
+    }
+
+    Ok(())
+}
+
+fn parse_natural(value: &str) -> Result<Natural, String> {
+    // remove underscores from input but not commas or periods (as they may be intended as decimal seperators)
+    match Natural::from_str(&value.replace('_', "")) {
+        Ok(natural) => Ok(natural),
+        Err(()) => Err(String::from(
+            "input must consist only of digits and underscores",
+        )),
     }
 }

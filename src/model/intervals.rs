@@ -1,11 +1,11 @@
 use std::{
     cmp::Ordering,
     fmt::Display,
-    ops::{Add, AddAssign, Div, Mul, Neg, Sub},
+    ops::{Add, AddAssign, Div, Mul, Neg, Shl, Sub, SubAssign},
 };
 
 use malachite::{
-    Integer,
+    Integer, Natural,
     base::{
         num::{
             basic::traits::{Infinity, NegativeInfinity, One, Zero},
@@ -62,7 +62,7 @@ impl Interval {
         Self::new_unchecked(new_lower, new_upper)
     }
 
-    pub fn recip(self) -> Self {
+    pub fn reciprocal(self) -> Self {
         if !self.contains(Float::ZERO) {
             let new_lower = self.upper.reciprocal_round(RoundingMode::Floor).0;
             let new_upper = self.lower.reciprocal_round(RoundingMode::Ceiling).0;
@@ -180,6 +180,23 @@ impl AddAssign for Interval {
     }
 }
 
+impl AddAssign<&Interval> for Interval {
+    fn add_assign(&mut self, rhs: &Interval) {
+        self.lower
+            .add_round_assign_ref(&rhs.lower, RoundingMode::Floor);
+        self.upper
+            .add_round_assign_ref(&rhs.upper, RoundingMode::Ceiling);
+    }
+}
+
+impl SubAssign for Interval {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.lower.sub_round_assign(rhs.upper, RoundingMode::Floor);
+        self.upper
+            .sub_round_assign(rhs.lower, RoundingMode::Ceiling);
+    }
+}
+
 impl Sub for Interval {
     type Output = Interval;
 
@@ -201,6 +218,14 @@ impl Sub<Interval> for &Interval {
 
     fn sub(self, rhs: Interval) -> Self::Output {
         self + -rhs
+    }
+}
+
+impl Shl<u64> for Interval {
+    type Output = Interval;
+
+    fn shl(self, rhs: u64) -> Self::Output {
+        Interval::new_unchecked(self.lower << rhs, self.upper << rhs)
     }
 }
 
@@ -252,6 +277,38 @@ impl Div for Interval {
     type Output = Interval;
 
     fn div(self, rhs: Self) -> Self::Output {
-        self * rhs.recip()
+        self * rhs.reciprocal()
+    }
+}
+
+impl Div<Interval> for Natural {
+    type Output = Interval;
+
+    fn div(self, rhs: Interval) -> Self::Output {
+        if !rhs.contains(Float::ZERO) {
+            // in practice the naturals passed to this function will never be large enough for the conversion to panic
+            let numerator: Float = self.try_into().unwrap();
+            let new_lower = numerator
+                .div_round_ref_val(rhs.upper, RoundingMode::Floor)
+                .0;
+            let new_upper = numerator.div_round(rhs.lower, RoundingMode::Ceiling).0;
+            Interval::new_unchecked(new_lower, new_upper)
+        } else {
+            Interval::EVERYWHERE
+        }
+    }
+}
+
+impl Div<&Natural> for Interval {
+    type Output = Interval;
+
+    fn div(self, rhs: &Natural) -> Self::Output {
+        let denomenator: Float = rhs.try_into().unwrap();
+        let new_lower = self
+            .lower
+            .div_round_val_ref(&denomenator, RoundingMode::Floor)
+            .0;
+        let new_upper = self.upper.div_round(denomenator, RoundingMode::Ceiling).0;
+        Interval::new_unchecked(new_lower, new_upper)
     }
 }
