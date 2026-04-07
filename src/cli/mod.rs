@@ -9,7 +9,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Seek, SeekFrom, Write},
     str::FromStr,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::Instant,
 };
@@ -45,7 +45,7 @@ pub struct Config {
 
     /// skip calculation of error bounds to save some extra calculations, at the cost of an extraordinarily small chance that the algorithm produces an incorrect digit every once in a while.
     #[argh(switch, long = "fast")]
-    pub fast: bool,
+    pub is_fast: bool,
 }
 
 pub fn run(config: Config) -> Result<(), io::Error> {
@@ -82,26 +82,36 @@ pub fn run(config: Config) -> Result<(), io::Error> {
     let program_start_time = Instant::now();
     let (sender, reciever) = mpsc::channel();
 
-    for thread_id in 0..config.num_threads {
+    // shared counter holding the next byte index that has not yet started calculation
+    let next_byte = Arc::new(Mutex::new(first_byte_index.clone()));
+
+    for _ in 0..config.num_threads {
         let channel = sender.clone();
+        let next_byte = Arc::clone(&next_byte);
         let first_byte_index = first_byte_index.clone();
         let last_byte_index = last_byte_index.clone();
+
         thread::spawn(move || {
             // initial value, incremented each time there is not enough precision
-            let mut interval_precision = 12;
-            // first byte to be calculated
-            let first_thread_index = first_byte_index + Natural::from(thread_id);
-            let mut byte_index = first_thread_index;
+            // empirically a better bound 2.2 * significant_bits + 9, but this is good enough
+            let mut interval_precision = 2 * first_byte_index.significant_bits() + 8;
 
-            // loop until the last byte has been reached
-            while last_byte_index
-                .clone()
-                .into_iter()
-                .all(|last| byte_index <= last)
-            {
+            loop {
+                // atomically get and increment the next byte index
+                let byte_index = {
+                    let mut guard = next_byte.lock().unwrap();
+                    // check if we've reached the end
+                    if last_byte_index.as_ref().is_some_and(|last| *guard >= *last) {
+                        break;
+                    }
+                    let current = guard.clone();
+                    *guard += Natural::ONE;
+                    current
+                };
+
                 let byte_time = Instant::now();
 
-                let byte = if config.fast {
+                let byte = if config.is_fast {
                     let precision = 2 * byte_index.significant_bits() + 8;
                     model::calculate_byte(&byte_index, precision)
                 } else {
@@ -109,10 +119,10 @@ pub fn run(config: Config) -> Result<(), io::Error> {
                         match model::calculate_byte_interval(&byte_index, interval_precision) {
                             Some(byte) => break byte,
                             None => {
-                                // eprintln!(
-                                //     "\rbyte {} needs more precision than {interval_precision}        ",
-                                //     byte_index.clone()
-                                // );
+                                eprintln!(
+                                    "\rbyte {} needs more precision than {interval_precision}         ",
+                                    byte_index.clone()
+                                );
                                 interval_precision += 1
                             }
                         };
@@ -127,14 +137,13 @@ pub fn run(config: Config) -> Result<(), io::Error> {
                         program_start_time.elapsed().as_millis() as usize,
                     ))
                     .unwrap();
-
-                byte_index += Natural::from(config.num_threads);
             }
         });
     }
     drop(sender);
 
     let mut queue = BinaryHeap::new();
+    // seperate counter for bytes that are in the middle of being calculated
     let mut next_pos = first_byte_index.clone();
     let mut bytes = Vec::with_capacity(2 * config.num_threads as usize);
 
