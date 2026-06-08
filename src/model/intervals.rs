@@ -1,84 +1,53 @@
-use std::{
-    cmp::Ordering,
-    fmt::Display,
-    ops::{Add, AddAssign, Div, Mul, Neg, Shl, Sub, SubAssign},
-};
-
-use malachite::{
-    Integer, Natural,
-    base::{
-        num::{
-            basic::traits::{Infinity, NegativeInfinity, One, Zero},
-            conversion::traits::RoundingFrom,
-        },
-        rounding_modes::RoundingMode,
-    },
-};
+use malachite::base::num::arithmetic::traits::{NegAssign, ShlRoundAssign, ShrRoundAssign};
+use malachite::base::num::basic::traits::{Infinity, NegativeInfinity, Zero};
+use malachite::base::num::conversion::string::options::ToSciOptions;
+use malachite::base::num::conversion::traits::{RoundingFrom, ToSci};
+use malachite::base::rounding_modes::RoundingMode::{self, Ceiling, Floor};
+use malachite::{Integer, Natural, Rational};
 use malachite_float::Float;
+use std::cmp::Ordering;
+use std::fmt::{Debug, Display};
+use std::ops::{Add, AddAssign, Mul, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
+
+use crate::model::NICE_CAST;
 
 /// An interval of real numbers, as in interval arithmetic.
 #[derive(Clone)]
-pub struct Interval {
-    pub lower: Float,
-    pub upper: Float,
+pub(crate) struct Interval {
+    pub inf: Float,
+    pub sup: Float,
 }
 
 impl Interval {
-    pub const ZERO: Self = Self::new_unchecked(Float::ZERO, Float::ZERO);
-    pub const ONE: Self = Self::new_unchecked(Float::ONE, Float::ONE);
-    pub const EVERYWHERE: Self = Self::new_unchecked(Float::NEGATIVE_INFINITY, Float::INFINITY);
+    pub(crate) const ZERO: Self = Self::new_unchecked(Float::ZERO, Float::ZERO);
+    pub(crate) const ENTIRE: Self = Self::new_unchecked(Float::NEGATIVE_INFINITY, Float::INFINITY);
 
-    pub const fn new_unchecked(lower: Float, upper: Float) -> Self {
-        Self { lower, upper }
+    pub(crate) const fn new_unchecked(inf: Float, sup: Float) -> Self {
+        Self { inf, sup }
     }
 
-    pub fn new(lhs: Float, rhs: Float) -> Self {
-        if lhs <= rhs {
-            Self {
-                lower: lhs,
-                upper: rhs,
-            }
-        } else {
-            Self {
-                lower: rhs,
-                upper: lhs,
-            }
-        }
-    }
-
-    pub fn union(self, rhs: Interval) -> Interval {
-        let new_lower = if self.lower <= rhs.lower {
-            self.lower
-        } else {
-            rhs.lower
-        };
-
-        let new_upper = if self.upper >= rhs.upper {
-            self.upper
-        } else {
-            rhs.upper
-        };
-
-        Self::new_unchecked(new_lower, new_upper)
-    }
-
-    pub fn reciprocal(self) -> Self {
+    pub(crate) fn reciprocal(mut self) -> Self {
         if !self.contains(Float::ZERO) {
-            let new_lower = self.upper.reciprocal_round(RoundingMode::Floor).0;
-            let new_upper = self.lower.reciprocal_round(RoundingMode::Ceiling).0;
-            Self::new_unchecked(new_lower, new_upper)
+            self.sup.reciprocal_round_assign(Floor);
+            self.inf.reciprocal_round_assign(Ceiling);
+            std::mem::swap(&mut self.inf, &mut self.sup);
+            self
         } else {
-            Self::EVERYWHERE
+            Self::ENTIRE
         }
     }
 
-    pub fn contains(&self, val: Float) -> bool {
-        self.lower <= val && val <= self.upper
+    pub(crate) fn contains(&self, val: Float) -> bool {
+        self.inf <= val && val <= self.sup
     }
 
-    pub fn try_floor(&self) -> Option<Integer> {
-        let floored_lower = Integer::rounding_from(&self.lower, RoundingMode::Floor).0;
-        let floored_upper = Integer::rounding_from(&self.upper, RoundingMode::Floor).0;
+    pub(crate) fn width(&self) -> Float {
+        self.sup.sub_round_ref_ref(&self.inf, Ceiling).0
+    }
+
+    pub(crate) fn try_floor(&self) -> Option<Integer> {
+        let (floored_lower, _) = Integer::rounding_from(&self.inf, Floor);
+        let (floored_upper, _) = Integer::rounding_from(&self.sup, Floor);
         if floored_lower == floored_upper {
             Some(floored_lower)
         } else {
@@ -86,29 +55,104 @@ impl Interval {
         }
     }
 
-    pub fn try_ceil(&self) -> Option<Integer> {
-        let ceiled_lower = Integer::rounding_from(&self.lower, RoundingMode::Ceiling).0;
-        let ceiled_upper = Integer::rounding_from(&self.upper, RoundingMode::Ceiling).0;
-        if ceiled_lower == ceiled_upper {
-            Some(ceiled_lower)
+    // returns the unique integer contained in the interval, or the number of integers contained in the interval otherwise.
+    pub(crate) fn inner_int(&self) -> Result<Integer, Integer> {
+        let (ceiled_lower, _) = Integer::rounding_from(&self.inf, RoundingMode::Ceiling);
+        let (floored_upper, _) = Integer::rounding_from(&self.sup, RoundingMode::Floor);
+        if ceiled_lower == floored_upper {
+            Ok(ceiled_lower)
         } else {
-            None
+            Err(floored_upper - ceiled_lower + Integer::const_from_unsigned(1))
+        }
+    }
+
+    pub(crate) fn maybe(self) -> Interval {
+        if self.inf > 0 {
+            Self::new_unchecked(Float::ZERO, self.sup)
+        } else if self.sup < 0 {
+            Self::new_unchecked(self.inf, Float::ZERO)
+        } else {
+            self
         }
     }
 }
 
 impl Display for Interval {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}, {}]", self.lower, self.upper)
+        write!(f, "[{}, {}]", self.inf, self.sup)
     }
+}
+
+impl Debug for Interval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}, {}]",
+            fmt_debug_round(&self.inf, Floor, f),
+            fmt_debug_round(&self.sup, Ceiling, f)
+        )
+    }
+}
+
+// format in hex for now
+fn fmt_debug_round(x: &Float, rm: RoundingMode, f: &std::fmt::Formatter<'_>) -> String {
+    let mut string = String::new();
+    if x.is_nan() {
+        return String::from("NaN");
+    };
+
+    if f.sign_plus() && x.is_sign_positive() {
+        string += "+";
+    } else if x.is_sign_negative() {
+        string += "-";
+    }
+
+    if x.is_infinite() {
+        return string + "inf";
+    }
+
+    if f.alternate() {
+        string += "0x";
+    }
+
+    if x == &0 {
+        return string + "0";
+    };
+
+    // the number of significant figures in the significand should be equal to prec
+    let prec = x
+        .get_prec()
+        .expect("already handled floats with no precision");
+
+    let mut sci_options = ToSciOptions::default();
+    sci_options.set_base(16);
+    sci_options.set_rounding_mode(rm);
+    sci_options.set_size_complete();
+    sci_options.set_include_trailing_zeros(true);
+
+    let rational = Rational::try_from(x).expect("infinities already handled");
+    let formatted = rational.to_sci_with_options(sci_options).to_string();
+    string + formatted.trim_start_matches('-') + "#" + prec.to_string().as_str()
 }
 
 impl From<Float> for Interval {
     fn from(value: Float) -> Self {
         Self {
-            lower: value.clone(),
-            upper: value,
+            inf: value.clone(),
+            sup: value,
         }
+    }
+}
+
+impl From<Natural> for Interval {
+    fn from(value: Natural) -> Self {
+        Self::from(Float::try_from(value).expect(NICE_CAST))
+    }
+}
+
+impl From<Integer> for Interval {
+    fn from(value: Integer) -> Self {
+        Self::from(Float::try_from(value).expect(NICE_CAST))
     }
 }
 
@@ -116,25 +160,36 @@ impl From<(Float, Ordering)> for Interval {
     fn from((float, ordering): (Float, Ordering)) -> Self {
         match ordering {
             Ordering::Equal => float.into(),
+            // the given value is less than the real value, so increment the given value to get the bounds
             Ordering::Less => {
-                let mut lower = float.clone();
-                lower.decrement();
-                Self::new(lower, float)
-            }
-            Ordering::Greater => {
                 let mut upper = float.clone();
                 upper.increment();
-                Self::new(float, upper)
+                Self::new_unchecked(float, upper)
+            }
+            // the given value is greater than the real value, so decrement the given value to get the bounds
+            Ordering::Greater => {
+                let mut lower = float.clone();
+                lower.decrement();
+                Self::new_unchecked(lower, float)
             }
         }
+    }
+}
+
+impl NegAssign for Interval {
+    fn neg_assign(&mut self) {
+        self.inf.neg_assign();
+        self.sup.neg_assign();
+        std::mem::swap(&mut self.inf, &mut self.sup);
     }
 }
 
 impl Neg for Interval {
     type Output = Interval;
 
-    fn neg(self) -> Self::Output {
-        Self::new_unchecked(-self.upper, -self.lower)
+    fn neg(mut self) -> Self::Output {
+        self.neg_assign();
+        self
     }
 }
 
@@ -142,17 +197,96 @@ impl Neg for &Interval {
     type Output = Interval;
 
     fn neg(self) -> Self::Output {
-        Interval::new_unchecked(-&self.upper, -&self.lower)
+        Interval::new_unchecked(-&self.sup, -&self.inf)
     }
 }
 
-impl Add for Interval {
+impl<T> ShlAssign<T> for Interval
+where
+    Float: ShlRoundAssign<T>,
+    T: Copy,
+{
+    fn shl_assign(&mut self, rhs: T) {
+        self.inf.shl_round_assign(rhs, Floor);
+        self.sup.shl_round_assign(rhs, Ceiling);
+    }
+}
+
+impl<T> ShrAssign<T> for Interval
+where
+    Float: ShrRoundAssign<T>,
+    T: Copy,
+{
+    fn shr_assign(&mut self, rhs: T) {
+        self.inf.shr_round_assign(rhs, Floor);
+        self.sup.shr_round_assign(rhs, Ceiling);
+    }
+}
+
+impl<T> Shl<T> for Interval
+where
+    Interval: ShlAssign<T>,
+{
     type Output = Interval;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        let new_lower = self.lower.add_round(rhs.lower, RoundingMode::Floor).0;
-        let new_upper = self.upper.add_round(rhs.upper, RoundingMode::Ceiling).0;
-        Self::new_unchecked(new_lower, new_upper)
+    fn shl(mut self, rhs: T) -> Self::Output {
+        self <<= rhs;
+        self
+    }
+}
+
+impl<T> Shr<T> for Interval
+where
+    Interval: ShrAssign<T>,
+{
+    type Output = Interval;
+
+    fn shr(mut self, rhs: T) -> Self::Output {
+        self >>= rhs;
+        self
+    }
+}
+
+impl Mul<Natural> for Interval {
+    type Output = Interval;
+
+    fn mul(mut self, rhs: Natural) -> Self::Output {
+        let float = Float::try_from(rhs).expect(NICE_CAST);
+        self.inf.mul_round_assign_ref(&float, Floor);
+        self.sup.mul_round_assign_ref(&float, Ceiling);
+        self
+    }
+}
+
+impl AddAssign<Interval> for Interval {
+    fn add_assign(&mut self, rhs: Interval) {
+        self.inf.add_round_assign(rhs.inf, Floor);
+        self.sup.add_round_assign(rhs.sup, Ceiling);
+    }
+}
+
+impl AddAssign<&Interval> for Interval {
+    fn add_assign(&mut self, rhs: &Interval) {
+        self.inf.add_round_assign_ref(&rhs.inf, Floor);
+        self.sup.add_round_assign_ref(&rhs.sup, Ceiling);
+    }
+}
+
+impl Add<Interval> for Interval {
+    type Output = Interval;
+
+    fn add(mut self, rhs: Interval) -> Self::Output {
+        self.add_assign(rhs);
+        self
+    }
+}
+
+impl Add<&Interval> for Interval {
+    type Output = Interval;
+
+    fn add(mut self, rhs: &Interval) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
@@ -160,56 +294,53 @@ impl Add<Interval> for &Interval {
     type Output = Interval;
 
     fn add(self, rhs: Interval) -> Self::Output {
-        let new_lower = self
-            .lower
-            .add_round_ref_val(rhs.lower, RoundingMode::Floor)
-            .0;
-        let new_upper = self
-            .upper
-            .add_round_ref_val(rhs.upper, RoundingMode::Ceiling)
-            .0;
-        Interval::new_unchecked(new_lower, new_upper)
+        Interval {
+            inf: self.inf.add_round_ref_val(rhs.inf, Floor).0,
+            sup: self.sup.add_round_ref_val(rhs.sup, Ceiling).0,
+        }
     }
 }
 
-impl AddAssign for Interval {
-    fn add_assign(&mut self, rhs: Self) {
-        self.lower.add_round_assign(rhs.lower, RoundingMode::Floor);
-        self.upper
-            .add_round_assign(rhs.upper, RoundingMode::Ceiling);
-    }
-}
-
-impl AddAssign<&Interval> for Interval {
-    fn add_assign(&mut self, rhs: &Interval) {
-        self.lower
-            .add_round_assign_ref(&rhs.lower, RoundingMode::Floor);
-        self.upper
-            .add_round_assign_ref(&rhs.upper, RoundingMode::Ceiling);
-    }
-}
-
-impl SubAssign for Interval {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.lower.sub_round_assign(rhs.upper, RoundingMode::Floor);
-        self.upper
-            .sub_round_assign(rhs.lower, RoundingMode::Ceiling);
-    }
-}
-
-impl Sub for Interval {
+impl Add<&Interval> for &Interval {
     type Output = Interval;
 
-    fn sub(self, rhs: Self) -> Self::Output {
-        self + -rhs
+    fn add(self, rhs: &Interval) -> Self::Output {
+        Interval {
+            inf: self.inf.add_round_ref_ref(&rhs.inf, Floor).0,
+            sup: self.sup.add_round_ref_ref(&rhs.sup, Ceiling).0,
+        }
+    }
+}
+
+impl SubAssign<Interval> for Interval {
+    fn sub_assign(&mut self, rhs: Interval) {
+        self.inf.sub_round_assign(rhs.sup, Floor);
+        self.sup.sub_round_assign(rhs.inf, Ceiling);
+    }
+}
+
+impl SubAssign<&Interval> for Interval {
+    fn sub_assign(&mut self, rhs: &Interval) {
+        self.inf.sub_round_assign_ref(&rhs.sup, Floor);
+        self.sup.sub_round_assign_ref(&rhs.inf, Ceiling);
+    }
+}
+
+impl Sub<Interval> for Interval {
+    type Output = Interval;
+
+    fn sub(mut self, rhs: Interval) -> Self::Output {
+        self -= rhs;
+        self
     }
 }
 
 impl Sub<&Interval> for Interval {
     type Output = Interval;
 
-    fn sub(self, rhs: &Interval) -> Self::Output {
-        self + -rhs
+    fn sub(mut self, rhs: &Interval) -> Self::Output {
+        self -= rhs;
+        self
     }
 }
 
@@ -217,98 +348,20 @@ impl Sub<Interval> for &Interval {
     type Output = Interval;
 
     fn sub(self, rhs: Interval) -> Self::Output {
-        self + -rhs
-    }
-}
-
-impl Shl<u64> for Interval {
-    type Output = Interval;
-
-    fn shl(self, rhs: u64) -> Self::Output {
-        Interval::new_unchecked(self.lower << rhs, self.upper << rhs)
-    }
-}
-
-impl Mul<Interval> for Float {
-    type Output = Interval;
-
-    fn mul(self, rhs: Interval) -> Self::Output {
-        let multiplied_lower: Interval = self
-            .mul_round_ref_val(rhs.lower, RoundingMode::Nearest)
-            .into();
-
-        let multiplied_upper: Interval = self
-            .mul_round_ref_val(rhs.upper, RoundingMode::Nearest)
-            .into();
-
-        multiplied_lower.union(multiplied_upper)
-    }
-}
-
-impl Mul<&Interval> for Float {
-    type Output = Interval;
-
-    fn mul(self, rhs: &Interval) -> Self::Output {
-        let multiplied_lower: Interval = self
-            .mul_round_ref_ref(&rhs.lower, RoundingMode::Nearest)
-            .into();
-
-        let multiplied_upper: Interval = self
-            .mul_round_ref_ref(&rhs.upper, RoundingMode::Nearest)
-            .into();
-
-        multiplied_lower.union(multiplied_upper)
-    }
-}
-
-impl Mul for Interval {
-    type Output = Interval;
-
-    fn mul(self, rhs: Interval) -> Self::Output {
-        let multiplied_lower: Interval = self.lower * &rhs;
-        let multiplied_upper = self.upper * &rhs;
-
-        multiplied_lower.union(multiplied_upper)
-    }
-}
-
-#[allow(clippy::suspicious_arithmetic_impl)]
-impl Div for Interval {
-    type Output = Interval;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        self * rhs.reciprocal()
-    }
-}
-
-impl Div<Interval> for Natural {
-    type Output = Interval;
-
-    fn div(self, rhs: Interval) -> Self::Output {
-        if !rhs.contains(Float::ZERO) {
-            // in practice the naturals passed to this function will never be large enough for the conversion to panic
-            let numerator: Float = self.try_into().unwrap();
-            let new_lower = numerator
-                .div_round_ref_val(rhs.upper, RoundingMode::Floor)
-                .0;
-            let new_upper = numerator.div_round(rhs.lower, RoundingMode::Ceiling).0;
-            Interval::new_unchecked(new_lower, new_upper)
-        } else {
-            Interval::EVERYWHERE
+        Interval {
+            inf: self.inf.sub_round_ref_val(rhs.sup, Floor).0,
+            sup: self.sup.sub_round_ref_val(rhs.inf, Ceiling).0,
         }
     }
 }
 
-impl Div<&Natural> for Interval {
+impl Sub<&Interval> for &Interval {
     type Output = Interval;
 
-    fn div(self, rhs: &Natural) -> Self::Output {
-        let denomenator: Float = rhs.try_into().unwrap();
-        let new_lower = self
-            .lower
-            .div_round_val_ref(&denomenator, RoundingMode::Floor)
-            .0;
-        let new_upper = self.upper.div_round(denomenator, RoundingMode::Ceiling).0;
-        Interval::new_unchecked(new_lower, new_upper)
+    fn sub(self, rhs: &Interval) -> Self::Output {
+        Interval {
+            inf: self.inf.sub_round_ref_ref(&rhs.sup, Floor).0,
+            sup: self.sup.sub_round_ref_ref(&rhs.inf, Ceiling).0,
+        }
     }
 }

@@ -3,6 +3,9 @@ name = "tick-tock-tau"
 version = "2.0.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -13,4 +16,14 @@ debug = true
 argh = "0.1.19"
 malachite = "0.9.1"
 malachite-float = "0.9.1"
-mimalloc = { version = "^0.1", default-features = false }
+rayon = "1.12.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mimalloc = { version = "0.1.50", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.118"
+js-sys = "0.3.95"
+
+[features]
+alternate = []
