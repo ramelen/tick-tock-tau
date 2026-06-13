@@ -2,7 +2,9 @@ pub mod intervals;
 
 use crate::cli::{SENDABLE, Status};
 use crate::model::intervals::Interval;
-use malachite::base::num::arithmetic::traits::{ModPow, NegAssign, Parity, UnsignedAbs};
+use malachite::base::num::arithmetic::traits::{
+    CeilingDivNegMod, ModPow, NegAssign, Parity, UnsignedAbs,
+};
 use malachite::base::num::conversion::traits::WrappingFrom;
 use malachite::base::num::logic::traits::SignificantBits;
 use malachite::base::rounding_modes::RoundingMode;
@@ -276,8 +278,8 @@ pub(crate) fn send_byte_range_parallel(
     // the bytes of tau calculated so far, starting at `start`.
     let mut bytes = Vec::new();
 
-    // terms ~= bytes * 8 (bits/byte) / 10 (bits/term)
-    let expected_iters = ((start + Natural::from(min_batch_size)) * N8) / N10;
+    // total # of terms needed ~= bytes * 8 (bits/byte) / 10 (bits/term)
+    let (approx_terms, _) = ((start + Natural::from(min_batch_size)) * N8).ceiling_div_neg_mod(N10);
 
     // n: the iteration number, because ranges of `malachite::Natural` can't be iterated over directly.
     // acc: the accumulator that holds the current partial sum from Bellard's formula.
@@ -294,7 +296,7 @@ pub(crate) fn send_byte_range_parallel(
             sender
                 .send(Status::Calculating {
                     current: n.clone(),
-                    expected: expected_iters.clone(),
+                    expected: approx_terms.clone(),
                 })
                 .expect(SENDABLE);
             (N1, bellard_term(&n, &offset, precision) << BITS)
@@ -318,7 +320,7 @@ pub(crate) fn send_byte_range_parallel(
         sender
             .send(Status::Calculating {
                 current: n.clone(),
-                expected: expected_iters.clone(),
+                expected: approx_terms.clone(),
             })
             .expect(SENDABLE);
 

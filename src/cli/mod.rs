@@ -22,47 +22,7 @@ pub(crate) enum Status {
     Finished(Vec<u8>),
 }
 
-const STATUS_FRAME_TIME: Duration = Duration::from_millis(10);
-macro_rules! status {
-    ($start:ident, $width:ident, $fmt:expr) => {
-        if $start.elapsed() > STATUS_FRAME_TIME {
-            let msg = format!($fmt);
-            let len = msg.len();
-            let additional_space = ' '.to_string().repeat($width.saturating_sub(len));
-            print!("\r{msg}{additional_space}");
-            std::io::stdout().flush().unwrap();
-            $width = msg.len();
-            $start = Instant::now();
-        }
-    };
-    ($start:ident, $width:ident, $fmt:expr, $($args:tt)*) => {
-        if $start.elapsed() > STATUS_FRAME_TIME {
-            let msg = format!($fmt, $($args)*);
-            let len = msg.len();
-            let additional_space = ' '.to_string().repeat($width.saturating_sub(len));
-            print!("\r{msg}{additional_space}");
-            std::io::stdout().flush().unwrap();
-            $width = msg.len();
-            $start = Instant::now();
-        }
-    };
-    ($width:ident, $fmt:expr) => {
-        let msg = format!($fmt);
-        let len = msg.len();
-        let additional_space = ' '.to_string().repeat($width.saturating_sub(len));
-        print!("\r{msg}{additional_space}");
-        std::io::stdout().flush().unwrap();
-        $width = msg.len();
-    };
-    ($width:ident, $fmt:expr, $($args:tt)*) => {
-        let msg = format!($fmt, $($args)*);
-        let len = msg.len();
-        let additional_space = ' '.to_string().repeat($width.saturating_sub(len));
-        print!("\r{msg}{additional_space}");
-        std::io::stdout().flush().unwrap();
-        $width = msg.len();
-    };
-}
+const STATUS_FRAME_TIME: Duration = Duration::from_millis(1);
 
 pub fn run(config: Config) -> Result<(), io::Error> {
     // open the output file if a path was given, returning early if the file couldn't be opened
@@ -119,18 +79,13 @@ pub fn run(config: Config) -> Result<(), io::Error> {
     let mut status_start = Instant::now();
     let mut status_len: usize = 0;
     let mut bytes_per_second = 0.0;
-    let mut batch_time = String::new();
+    let mut batch_time = None;
 
     let mut precision = config
         .initial_precision
         .map(NonZeroU64::get)
         .unwrap_or((first_byte_index.significant_bits() / 4 + 1) * 8);
     // .unwrap_or(u64::try_from(config.min_batch_size.get()).expect(NICE_CAST) * 8);
-
-    if !(config.is_quiet || config.no_status) {
-        print!("determining initial precision: currently {precision} bits");
-        std::io::stdout().flush().unwrap();
-    }
 
     'outer: while last_byte_index
         .as_ref()
@@ -215,18 +170,26 @@ pub fn run(config: Config) -> Result<(), io::Error> {
                         let mut options = ToSciOptions::default();
                         options.set_scale(1);
                         options.set_include_trailing_zeros(true);
-                        status!(
-                            status_start,
-                            status_len,
-                            "calculating batch at index {} (uptime: {}, batch time: {}, speed: {:.1} B/s, precision: {} bits): {}%",
-                            current_byte_index,
-                            fmt_time(program_start.elapsed()),
-                            batch_time,
-                            bytes_per_second,
-                            precision,
-                            (Rational::from_naturals(current, expected) * Q100)
-                                .to_sci_with_options(options)
-                        );
+                        if status_start.elapsed() > STATUS_FRAME_TIME {
+                            let status = format!(
+                                "calculating batch at index {} (uptime: {}, batch time: {}, speed: {:.1} B/s, precision: {} bits): {:}%",
+                                current_byte_index,
+                                fmt_time(program_start.elapsed()),
+                                fmt_time(batch_time.unwrap_or(batch_start.elapsed())),
+                                bytes_per_second,
+                                precision,
+                                (Rational::from_naturals(current, expected) * Q100)
+                                    .to_sci_with_options(options)
+                            );
+                            let len = status.len();
+                            let additional_space =
+                                ' '.to_string().repeat(status_len.saturating_sub(len));
+                            // the extra space char is so that the cursor isn't right next to the end of the line
+                            print!("\r{status}{additional_space} ");
+                            std::io::stdout().flush().unwrap();
+                            status_len = len;
+                            status_start = Instant::now();
+                        };
                     }
                     Status::InsufficientPrecision(bytes) => {
                         let bytes_left = min_batch_size - bytes.len();
@@ -253,26 +216,38 @@ pub fn run(config: Config) -> Result<(), io::Error> {
                         };
 
                         if !config.no_waterfall {
-                            println!(
-                                "\r{current_byte_index:#x}: {}",
+                            let waterfall = format!(
+                                "{current_byte_index:#x}: {}",
                                 bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
                             );
+
+                            let len = waterfall.len();
+                            let additional_space =
+                                ' '.to_string().repeat(status_len.saturating_sub(len));
+                            println!("\r{waterfall}{additional_space}");
+                            status_len = 0;
                         }
 
                         current_byte_index += Natural::from(bytes.len());
 
-                        batch_time = fmt_time(batch_start.elapsed());
+                        batch_time = Some(batch_start.elapsed());
                         bytes_per_second = bytes.len() as f64 / batch_start.elapsed().as_secs_f64();
 
-                        status!(
-                            status_len,
+                        let status = format!(
                             "calculating batch at index {} (uptime: {}, batch time: {}, speed: {:.1} B/s, precision: {} bits): 100%",
                             current_byte_index,
                             fmt_time(program_start.elapsed()),
-                            batch_time,
+                            fmt_time(batch_time.unwrap()),
                             bytes_per_second,
                             precision
                         );
+                        let len = status.len();
+                        let additional_space =
+                            ' '.to_string().repeat(status_len.saturating_sub(len) + 1);
+                        // the extra space char is so that the cursor isn't right next to the end of the line
+                        print!("\r{status}{additional_space} ");
+                        std::io::stdout().flush().unwrap();
+                        status_len = len;
                     }
                 }
             }
@@ -305,8 +280,8 @@ fn fmt_time(duration: Duration) -> String {
     };
 
     let seconds_str = match seconds % 60 {
-        1 if minutes >= 1 => "1 second",
-        s if minutes >= 1 => &(s.to_string() + " seconds"),
+        1 if seconds >= 60 => "1 second",
+        s if seconds >= 60 => &(s.to_string() + " seconds"),
         s => &format!("{s}.{:03} seconds", duration.subsec_millis()),
     };
 
