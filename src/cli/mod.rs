@@ -126,7 +126,7 @@ pub fn run(config: Config) -> Result<(), io::Error> {
             if let Some(file) = log.as_mut() {
                 writeln!(
                     file,
-                    "{}, {}, {} {:.06}, {:.06},",
+                    "{}, {}, {}, {:.06}, {:.06},",
                     current_byte_index,
                     bytes.len(),
                     precision,
